@@ -1,7 +1,5 @@
-# Tauri + Vue + TypeScript
+# AI-desktop-pet
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+学生制作的 AI 桌面伴侣项目。
 
-## Recommended IDE Setup
-
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+当前仓库包含桌宠前端、Tauri 桌面端、Python 后端服务，以及配套的感知、语音、记忆与交互模块源码。
