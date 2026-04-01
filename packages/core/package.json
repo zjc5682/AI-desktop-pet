@@ -1,0 +1,27 @@
+{
+  "name": "@table-pet/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "echo 'No build step required for @table-pet/core'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@table-pet/character": "workspace:*",
+    "@table-pet/memory": "workspace:*",
+    "@table-pet/plugins": "workspace:*",
+    "@table-pet/policy": "workspace:*",
+    "@table-pet/providers": "workspace:*",
+    "@table-pet/shared": "workspace:*",
+    "@table-pet/stage": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "~5.6.2"
+  }
+}

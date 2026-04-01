@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "preserve",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "paths": {
+      "@/*": ["./src/*"],
+      "@table-pet/character": ["../../packages/character/src"],
+      "@table-pet/core": ["../../packages/core/src"],
+      "@table-pet/live2d": ["../../packages/live2d/src"],
+      "@table-pet/memory": ["../../packages/memory/src"],
+      "@table-pet/perception": ["../../packages/perception/src"],
+      "@table-pet/plugins": ["../../packages/plugins/src"],
+      "@table-pet/policy": ["../../packages/policy/src"],
+      "@table-pet/providers": ["../../packages/providers/src"],
+      "@table-pet/realtime": ["../../packages/realtime/src"],
+      "@table-pet/ai-core": ["../../packages/ai-core/src"],
+      "@table-pet/shared": ["../../packages/shared/src"],
+      "@table-pet/stage": ["../../packages/stage/src"]
+    },
+    "types": ["@tauri-apps/api"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

@@ -1,0 +1,18 @@
+# 配置文件
+# 用于配置后端服务的各项参数
+
+# 聊天服务配置
+chat_provider: ollama  # 可选值: ollama, qwen_local
+
+# Ollama 配置
+ollama_url: http://localhost:11434  # Ollama 服务地址
+ollama_model: qwen2.5:7b  # 使用的模型名称
+temperature: 0.7  # 生成温度（0-1），越高越有创意
+max_tokens: 2048  # 最大生成 token 数
+
+# 本地 Qwen 配置（使用 llama-cpp-python）
+qwen_local:
+  model_path: models/qwen.gguf  # GGUF 模型文件路径
+  n_ctx: 4096  # 上下文长度
+  n_threads: 4  # 使用线程数
+  n_gpu_layers: 0  # GPU 加速层数（0 表示不使用 GPU）

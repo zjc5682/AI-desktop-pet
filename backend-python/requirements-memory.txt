@@ -1,0 +1,5 @@
+# required
+duckdb>=1.1,<2
+
+# optional vector index
+lancedb>=0.8,<1

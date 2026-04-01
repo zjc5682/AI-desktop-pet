@@ -1,0 +1,49 @@
+/*
+  tsconfig.node.json - Node.js环境TypeScript配置
+  功能：专门为Node.js工具文件（如vite.config.ts）配置TypeScript编译选项
+*/
+{
+  /*
+    编译器选项
+    针对Node.js环境的特殊配置
+  */
+  "compilerOptions": {
+    /*
+      复合项目模式
+      允许此配置被其他配置引用
+    */
+    "composite": true,
+
+    /*
+      跳过库文件类型检查
+      提高编译速度
+    */
+    "skipLibCheck": true,
+
+    /*
+      模块系统
+      ESNext: 使用最新的ES模块语法
+    */
+    "module": "ESNext",
+
+    /*
+      模块解析策略
+      bundler: 打包器风格的模块解析
+    */
+    "moduleResolution": "bundler",
+
+    /*
+      允许合成默认导入
+      允许从没有默认导出的模块进行默认导入
+    */
+    "allowSyntheticDefaultImports": true
+  },
+
+  /*
+    包含的文件
+    仅包含Node.js相关的配置文件
+  */
+  "include": [
+    "vite.config.ts"  // Vite构建配置文件
+  ]
+}

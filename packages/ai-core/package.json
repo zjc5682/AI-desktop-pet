@@ -1,0 +1,26 @@
+{
+  "name": "@table-pet/ai-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "echo 'No build step required for @table-pet/ai-core'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@table-pet/core": "workspace:*",
+    "@table-pet/providers": "workspace:*",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "typescript": "~5.6.2"
+  },
+  "peerDependencies": {
+    "vue": "^3.5.0"
+  }
+}

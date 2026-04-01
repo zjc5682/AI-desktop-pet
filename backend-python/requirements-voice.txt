@@ -1,0 +1,7 @@
+edge-tts
+faster-whisper
+openai-whisper
+numpy==2.0.0
+silero-vad
+torch==2.9.0
+transformers==5.4.0

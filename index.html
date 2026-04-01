@@ -1,0 +1,52 @@
+<!--
+  index.html - HTML入口文件
+  功能：应用的HTML模板，包含Live2D库的引用和Vue应用的挂载点
+-->
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <!-- 字符编码设置 -->
+    <meta charset="UTF-8" />
+
+    <!-- 网站图标 -->
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+
+    <!-- 视口设置，确保在移动设备上正确显示 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- 页面标题 -->
+    <title>My Desktop Pet</title>
+
+    <!--
+      Live2D库引用
+      支持 Cubism 2.1 和 Cubism 4
+      必须在Vue应用加载之前引入
+    -->
+    <script src="/libs/live2d.min.js"></script>
+    <script src="/libs/live2dcubismcore.min.js"></script>
+
+    <!--
+      全局对象设置
+      确保window.live2d指向正确的Live2D构造函数
+      这是为了兼容性考虑
+    -->
+    <script>
+      window.live2d = window.Live2D;
+    </script>
+  </head>
+
+  <body>
+    <!--
+      Vue应用挂载点
+      id="app" - Vue应用会挂载到这个div元素上
+    -->
+    <div id="app"></div>
+
+    <!--
+      Vue应用入口脚本
+      type="module" - ES模块支持
+      src="/src/main.ts" - 指向TypeScript入口文件
+    -->
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
