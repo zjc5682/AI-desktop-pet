@@ -5,7 +5,6 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter @table-pet/pet tauri dev",
-    "dev:web": "pnpm --filter @table-pet/pet dev",
     "build": "pnpm -r build",
     "build:pet": "pnpm --filter @table-pet/pet build"
   },

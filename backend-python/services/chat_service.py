@@ -72,6 +72,10 @@ LAST_USER_BLOCK_RE = re.compile(
     r'User:\s*(?P<content>.*?)(?:\nAssistant:\s*$|\Z)',
     re.IGNORECASE | re.DOTALL,
 )
+SERIALIZED_ROLE_LINE_RE = re.compile(
+    r'^(?P<role>System|User|Assistant|Tool):(?:\s*(?P<content>.*))?$',
+    re.IGNORECASE,
+)
 
 
 def _clean_text(text: str) -> str:
@@ -199,6 +203,74 @@ def _extract_user_text(message: str, metadata: dict[str, Any] | None) -> str:
         return _clean_text(matches[-1])
 
     return _clean_text(message)
+
+
+def _parse_chat_messages(prompt: str) -> list[dict[str, str]]:
+    raw_prompt = str(prompt or '').replace('\r\n', '\n')
+    if not raw_prompt.strip():
+        return []
+
+    messages: list[dict[str, str]] = []
+    preamble_lines: list[str] = []
+    current_role: str | None = None
+    current_lines: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_role, current_lines
+        if current_role is None:
+            return
+
+        content = '\n'.join(current_lines).strip()
+        if content or current_role != 'assistant':
+            messages.append({'role': current_role, 'content': content})
+        current_role = None
+        current_lines = []
+
+    for raw_line in raw_prompt.split('\n'):
+        line = raw_line.rstrip()
+        match = SERIALIZED_ROLE_LINE_RE.match(line.strip())
+        if match:
+            role = str(match.group('role') or '').strip().lower()
+            inline_content = str(match.group('content') or '')
+
+            if preamble_lines and not messages and current_role is None:
+                preamble = '\n'.join(preamble_lines).strip()
+                if preamble:
+                    messages.append({'role': 'system', 'content': preamble})
+                preamble_lines.clear()
+
+            flush_current()
+            current_role = role
+            current_lines = [inline_content] if inline_content else []
+            continue
+
+        if current_role is None:
+            preamble_lines.append(line)
+            continue
+
+        current_lines.append(line)
+
+    if preamble_lines and not messages and current_role is None:
+        preamble = '\n'.join(preamble_lines).strip()
+        if preamble:
+            messages.append({'role': 'system', 'content': preamble})
+
+    flush_current()
+
+    while messages and messages[-1]['role'] == 'assistant' and not messages[-1]['content'].strip():
+        messages.pop()
+
+    if not any(message['role'] == 'user' for message in messages):
+        return []
+
+    return [
+        {
+            'role': message['role'],
+            'content': str(message['content'] or '').strip(),
+        }
+        for message in messages
+        if str(message['content'] or '').strip() or message['role'] != 'assistant'
+    ]
 
 
 def _inject_context_into_prompt(prompt: str, context_block: str) -> str:
@@ -381,23 +453,10 @@ class OllamaChatService(BaseChatService):
         )
         self.model = str(config.get('ollama_model', 'qwen2.5:7b'))
 
-    def _payload(self, message: str, stream: bool) -> bytes:
-        return json.dumps(
-            {
-                'model': self.model,
-                'prompt': message,
-                'stream': stream,
-                'options': {
-                    'temperature': self.temperature,
-                    'num_predict': self.max_tokens,
-                },
-            }
-        ).encode('utf-8')
-
-    def _request(self, message: str, stream: bool):
+    def _request(self, endpoint: str, payload: dict[str, Any]):
         request = Request(
-            f'{self.base_url}/api/generate',
-            data=self._payload(message, stream=stream),
+            f'{self.base_url}{endpoint}',
+            data=json.dumps(payload).encode('utf-8'),
             headers={'Content-Type': 'application/json'},
             method='POST',
         )
@@ -413,8 +472,40 @@ class OllamaChatService(BaseChatService):
     ) -> str:
         _ = history, personality, style_vec
         prompt = self._augment_prompt(message, metadata)
+        messages = _parse_chat_messages(prompt)
         try:
-            with self._request(prompt, stream=False) as response:
+            if messages:
+                with self._request(
+                    '/api/chat',
+                    {
+                        'model': self.model,
+                        'messages': messages,
+                        'stream': False,
+                        'options': {
+                            'temperature': self.temperature,
+                            'num_predict': self.max_tokens,
+                        },
+                    },
+                ) as response:
+                    payload = json.loads(response.read().decode('utf-8'))
+                    message_payload = payload.get('message')
+                    if isinstance(message_payload, dict):
+                        return _clean_text(
+                            _extract_message_text(message_payload.get('content'))
+                        )
+
+            with self._request(
+                '/api/generate',
+                {
+                    'model': self.model,
+                    'prompt': prompt,
+                    'stream': False,
+                    'options': {
+                        'temperature': self.temperature,
+                        'num_predict': self.max_tokens,
+                    },
+                },
+            ) as response:
                 payload = json.loads(response.read().decode('utf-8'))
                 return _clean_text(str(payload.get('response', '')))
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
@@ -430,8 +521,52 @@ class OllamaChatService(BaseChatService):
     ) -> Iterable[str]:
         _ = history, personality, style_vec
         prompt = self._augment_prompt(message, metadata)
+        messages = _parse_chat_messages(prompt)
         try:
-            with self._request(prompt, stream=True) as response:
+            if messages:
+                with self._request(
+                    '/api/chat',
+                    {
+                        'model': self.model,
+                        'messages': messages,
+                        'stream': True,
+                        'options': {
+                            'temperature': self.temperature,
+                            'num_predict': self.max_tokens,
+                        },
+                    },
+                ) as response:
+                    for raw_line in response:
+                        line = raw_line.decode('utf-8', errors='ignore').strip()
+                        if not line:
+                            continue
+
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        message_payload = chunk.get('message')
+                        if not isinstance(message_payload, dict):
+                            continue
+
+                        content = _extract_message_text(message_payload.get('content'))
+                        if content:
+                            yield content
+                return
+
+            with self._request(
+                '/api/generate',
+                {
+                    'model': self.model,
+                    'prompt': prompt,
+                    'stream': True,
+                    'options': {
+                        'temperature': self.temperature,
+                        'num_predict': self.max_tokens,
+                    },
+                },
+            ) as response:
                 for raw_line in response:
                     line = raw_line.decode('utf-8', errors='ignore').strip()
                     if not line:
@@ -442,7 +577,7 @@ class OllamaChatService(BaseChatService):
                     except json.JSONDecodeError:
                         continue
 
-                    content = _clean_text(str(chunk.get('response', '')))
+                    content = str(chunk.get('response', ''))
                     if content:
                         yield content
         except (HTTPError, URLError, TimeoutError) as error:
@@ -562,10 +697,10 @@ class OpenAICompatibleChatService(BaseChatService):
         if not self.api_key:
             raise ValueError(f'{provider_name} API key is empty.')
 
-    def _request(self, message: str, stream: bool):
+    def _request(self, messages: list[dict[str, str]], stream: bool):
         payload = {
             'model': self.model,
-            'messages': [{'role': 'user', 'content': message}],
+            'messages': messages,
             'temperature': self.temperature,
             'max_tokens': self.max_tokens,
             'stream': stream,
@@ -592,7 +727,8 @@ class OpenAICompatibleChatService(BaseChatService):
     ) -> str:
         _ = history, personality, style_vec
         prompt = self._augment_prompt(message, metadata)
-        with self._request(prompt, stream=False) as response:
+        messages = _parse_chat_messages(prompt) or [{'role': 'user', 'content': prompt}]
+        with self._request(messages, stream=False) as response:
             payload = json.loads(response.read().decode('utf-8'))
         choices = payload.get('choices')
         if not isinstance(choices, list) or not choices:
@@ -615,10 +751,11 @@ class OpenAICompatibleChatService(BaseChatService):
     ) -> Iterable[str]:
         _ = history, personality, style_vec
         prompt = self._augment_prompt(message, metadata)
+        messages = _parse_chat_messages(prompt) or [{'role': 'user', 'content': prompt}]
         emitted_any = False
 
         try:
-            with self._request(prompt, stream=True) as response:
+            with self._request(messages, stream=True) as response:
                 for payload in _iter_sse_payloads(response):
                     choices = payload.get('choices')
                     if not isinstance(choices, list) or not choices:

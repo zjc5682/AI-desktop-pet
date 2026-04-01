@@ -19,8 +19,10 @@ import contextlib
 import inspect
 import json
 import os
+from pathlib import Path
 import re
 import socket
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -41,6 +43,7 @@ DEFAULT_ENERGY_THRESHOLD = 900
 DEFAULT_WAKE_TIMEOUT_SECONDS = 20.0
 DEFAULT_TTS_VOICE = 'zh-CN-XiaoxiaoNeural'
 DEFAULT_SPEECH_LANGUAGE = 'zh'
+DEFAULT_FASTER_WHISPER_MODEL_SIZE = 'small'
 DEFAULT_WAKE_WORD = '\u5c0f\u684c'
 PARTIAL_TRANSCRIPT_MIN_AUDIO_MS = 1200
 PARTIAL_TRANSCRIPT_INTERVAL_SECONDS = 1.4
@@ -73,6 +76,8 @@ LOW_LATENCY_EARLY_COMMIT_MIN_SPEECH_MS = 720
 TTS_STREAM_HARD_BREAK_CHARS = 32
 PRE_SPEECH_BUFFER_MS = 180
 VIBEVOICE_STREAM_POLL_SECONDS = 0.15
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+WORKSPACE_ROOT = BACKEND_ROOT.parent
 PARTIAL_TRANSCRIPT_PROMPT_WORD_LIMIT = 10
 CORRUPTED_WAKE_WORD_MARKERS = ('\ufffd', '鐏', '灏', '闁', '閻', '椤', '缁', '顢')
 
@@ -316,8 +321,206 @@ def _write_pcm16_wave(path: str, pcm_bytes: bytes, sample_rate: int) -> None:
         wav_file.writeframes(pcm_bytes)
 
 
+def _normalize_pcm16_mono_audio(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    sample_width: int = 2,
+    channels: int = 1,
+) -> bytes:
+    audio_bytes = bytes(pcm_bytes or b'')
+    if not audio_bytes:
+        return b''
+
+    width = max(1, int(sample_width or 2))
+    channel_count = max(1, int(channels or 1))
+    rate = max(1, int(sample_rate or DEFAULT_SAMPLE_RATE))
+
+    if width != 2:
+        audio_bytes = audioop.lin2lin(audio_bytes, width, 2)
+
+    if channel_count == 2:
+        audio_bytes = audioop.tomono(audio_bytes, 2, 0.5, 0.5)
+    elif channel_count > 2:
+        import numpy as np  # type: ignore
+
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+        if audio_array.size == 0:
+            return b''
+        frame_count = audio_array.size // channel_count
+        if frame_count <= 0:
+            return b''
+        audio_array = audio_array[: frame_count * channel_count]
+        audio_array = audio_array.reshape(frame_count, channel_count)
+        mixed = audio_array.mean(axis=1).astype(np.int16)
+        audio_bytes = mixed.tobytes()
+
+    if rate != DEFAULT_SAMPLE_RATE:
+        audio_bytes, _ = audioop.ratecv(
+            audio_bytes,
+            2,
+            1,
+            rate,
+            DEFAULT_SAMPLE_RATE,
+            None,
+        )
+
+    return audio_bytes
+
+
+def _pcm16_to_float32_audio(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    sample_width: int = 2,
+    channels: int = 1,
+):
+    import numpy as np  # type: ignore
+
+    normalized = _normalize_pcm16_mono_audio(
+        pcm_bytes,
+        sample_rate=sample_rate,
+        sample_width=sample_width,
+        channels=channels,
+    )
+    audio_array = np.frombuffer(normalized, dtype=np.int16)
+    if audio_array.size == 0:
+        return audio_array.astype(np.float32)
+    return audio_array.astype(np.float32) / 32768.0
+
+
+def _read_wave_pcm(
+    path: str,
+) -> tuple[bytes, int, int, int]:
+    with wave.open(path, 'rb') as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    return frames, sample_rate, sample_width, channels
+
+
 def _decode_json_response(payload: bytes) -> dict[str, Any]:
     return json.loads(payload.decode('utf-8'))
+
+
+def _format_optional_dependency_error(
+    error: Exception,
+    setup_command: str = 'npm run setup:backend:voice',
+) -> str:
+    if isinstance(error, ModuleNotFoundError):
+        package_name = str(getattr(error, 'name', '') or '').strip()
+        if package_name:
+            package_name = {
+                'faster_whisper': 'faster-whisper',
+                'edge_tts': 'edge-tts',
+                'silero_vad': 'silero-vad',
+                'whisper': 'openai-whisper',
+            }.get(package_name, package_name)
+            return (
+                f"Missing Python dependency '{package_name}'. "
+                f'Run {setup_command} from apps/pet.'
+            )
+
+    return str(error)
+
+
+def _normalize_faster_whisper_model_size(value: str) -> str:
+    normalized = str(value or '').strip().lower()
+    if normalized.startswith('systran/faster-whisper-'):
+        normalized = normalized.removeprefix('systran/faster-whisper-')
+    elif normalized.startswith('faster-whisper-'):
+        normalized = normalized.removeprefix('faster-whisper-')
+
+    return normalized or DEFAULT_FASTER_WHISPER_MODEL_SIZE
+
+
+def _maybe_ct2_model_dir(path: Path) -> Path | None:
+    candidate = path.expanduser()
+    if candidate.is_file():
+        candidate = candidate.parent
+    if not candidate.exists() or not candidate.is_dir():
+        return None
+    if (candidate / 'snapshots').is_dir():
+        snapshots = [
+            item
+            for item in (candidate / 'snapshots').iterdir()
+            if item.is_dir()
+        ]
+        if snapshots:
+            snapshots.sort(
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            candidate = snapshots[0]
+    if (candidate / 'model.bin').exists():
+        return candidate.resolve()
+    return None
+
+
+def _iter_local_model_candidates(model_path: str, model_size: str):
+    raw_path = str(model_path or '').strip()
+    if raw_path:
+        explicit = Path(raw_path).expanduser()
+        yield explicit
+        if not explicit.is_absolute():
+            yield BACKEND_ROOT / explicit
+            yield WORKSPACE_ROOT / explicit
+
+    size = _normalize_faster_whisper_model_size(model_size)
+    for root in (BACKEND_ROOT, WORKSPACE_ROOT):
+        yield root / 'models' / 'stt' / size
+        yield root / 'models' / f'faster-whisper-{size}'
+        yield root / 'models' / 'whisper' / size
+        yield root / 'models' / size
+
+
+def _iter_huggingface_cache_candidates(model_size: str):
+    size = _normalize_faster_whisper_model_size(model_size)
+    cache_roots: list[Path] = []
+
+    hf_home = str(os.getenv('HF_HOME') or '').strip()
+    if hf_home:
+        cache_roots.append(Path(hf_home).expanduser() / 'hub')
+
+    hub_cache = str(os.getenv('HUGGINGFACE_HUB_CACHE') or '').strip()
+    if hub_cache:
+        cache_roots.append(Path(hub_cache).expanduser())
+
+    cache_roots.append(Path.home() / '.cache' / 'huggingface' / 'hub')
+
+    repo_cache_name = f'models--Systran--faster-whisper-{size}'
+    seen: set[str] = set()
+    for cache_root in cache_roots:
+        cache_key = str(cache_root)
+        if cache_key in seen:
+            continue
+        seen.add(cache_key)
+        yield cache_root / repo_cache_name
+
+
+def _resolve_faster_whisper_model_path(
+    model_path: str,
+    model_size: str,
+) -> tuple[Path, str]:
+    for candidate in _iter_local_model_candidates(model_path, model_size):
+        resolved = _maybe_ct2_model_dir(candidate)
+        if resolved is not None:
+            source = 'configured-path' if str(model_path or '').strip() else 'workspace-model'
+            return resolved, source
+
+    for candidate in _iter_huggingface_cache_candidates(model_size):
+        resolved = _maybe_ct2_model_dir(candidate)
+        if resolved is not None:
+            return resolved, 'huggingface-cache'
+
+    requested_size = _normalize_faster_whisper_model_size(model_size)
+    raise FileNotFoundError(
+        'No local faster-whisper model was found. '
+        'Set STT model path to a local CTranslate2 model directory, or place '
+        f'Systran/faster-whisper-{requested_size} in the local Hugging Face cache first.'
+    )
 
 
 def _extract_http_text_response(payload: bytes, content_type: str) -> str:
@@ -605,11 +808,23 @@ class FasterWhisperTranscriber:
     available = True
     reason = ''
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        model_path: str = '',
+        model_size: str = DEFAULT_FASTER_WHISPER_MODEL_SIZE,
+    ) -> None:
         from faster_whisper import WhisperModel  # type: ignore
 
-        self.target = 'small'
-        self.model = WhisperModel('small', device='cpu', compute_type='int8')
+        resolved_model_path, model_source = _resolve_faster_whisper_model_path(
+            model_path,
+            model_size,
+        )
+        self.target = str(resolved_model_path)
+        self.model = WhisperModel(
+            str(resolved_model_path),
+            device='cpu',
+            compute_type='int8',
+        )
         self.metadata = {
             'sttMode': 'memory-pcm',
             'partialTranscripts': 'native',
@@ -617,6 +832,10 @@ class FasterWhisperTranscriber:
             'partialAnchorStrategy': 'stable-prefix-checkpoints',
             'partialDecodeStrategy': 'incremental-tail-merge-v5-smooth-anchor',
             'partialTranscriptState': 'stable-prefix-unstable-tail',
+            'modelPath': str(resolved_model_path),
+            'modelSize': _normalize_faster_whisper_model_size(model_size),
+            'modelSource': model_source,
+            'downloadsDisabled': True,
         }
 
     def transcribe(self, path: str, language: str = DEFAULT_SPEECH_LANGUAGE) -> str:
@@ -641,14 +860,13 @@ class FasterWhisperTranscriber:
         partial: bool = False,
         prefix_hint: str = '',
     ) -> str:
-        _ = sample_rate
-        import numpy as np  # type: ignore
-
-        audio_array = np.frombuffer(pcm_bytes, dtype=np.int16)
+        audio_float32 = _pcm16_to_float32_audio(
+            pcm_bytes,
+            sample_rate=sample_rate,
+        )
+        audio_array = audio_float32
         if audio_array.size == 0:
             return ''
-
-        audio_float32 = audio_array.astype(np.float32) / 32768.0
         options: dict[str, Any] = {
             'language': language,
             'beam_size': 1,
@@ -676,9 +894,68 @@ class OpenAIWhisperTranscriber:
 
         self.target = 'base'
         self.model = whisper.load_model('base')
+        self.metadata = {
+            'sttMode': 'memory-pcm',
+            'partialTranscripts': 'native',
+            'finalizationStrategy': 'incremental-tail-merge-v3',
+            'inputMode': 'pcm16-mono-16k',
+            'ffmpegRequiredForDesktopVoice': False,
+            'modelName': 'base',
+        }
 
     def transcribe(self, path: str, language: str = DEFAULT_SPEECH_LANGUAGE) -> str:
-        result = self.model.transcribe(path, language=language)
+        if str(path or '').lower().endswith('.wav'):
+            pcm_bytes, sample_rate, sample_width, channels = _read_wave_pcm(path)
+            return self.transcribe_pcm(
+                pcm_bytes,
+                sample_rate=sample_rate,
+                language=language,
+                sample_width=sample_width,
+                channels=channels,
+            )
+
+        result = self.model.transcribe(
+            path,
+            language=language,
+            fp16=False,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            temperature=0.0,
+        )
+        return _clean_text(str(result.get('text', '')))
+
+    def transcribe_pcm(
+        self,
+        pcm_bytes: bytes,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        language: str = DEFAULT_SPEECH_LANGUAGE,
+        *,
+        partial: bool = False,
+        prefix_hint: str = '',
+        sample_width: int = 2,
+        channels: int = 1,
+    ) -> str:
+        audio_float32 = _pcm16_to_float32_audio(
+            pcm_bytes,
+            sample_rate=sample_rate,
+            sample_width=sample_width,
+            channels=channels,
+        )
+        if getattr(audio_float32, 'size', 0) == 0:
+            return ''
+
+        options: dict[str, Any] = {
+            'language': language,
+            'fp16': False,
+            'condition_on_previous_text': False,
+            'without_timestamps': True,
+            'temperature': 0.0,
+        }
+        prompt = _build_partial_transcript_prompt(prefix_hint) if prefix_hint else ''
+        if partial and prompt:
+            options['initial_prompt'] = prompt
+
+        result = self.model.transcribe(audio_float32, **options)
         return _clean_text(str(result.get('text', '')))
 
 
@@ -733,6 +1010,16 @@ class EdgeTtsSynthesizer:
     available = True
     reason = ''
 
+    def __init__(self) -> None:
+        import edge_tts  # type: ignore
+
+        self.edge_tts = edge_tts
+        self.target = DEFAULT_TTS_VOICE
+        self.metadata = {
+            'mode': 'online',
+            'fallbackProvider': 'system-tts',
+        }
+
     async def synthesize(
         self,
         text: str,
@@ -740,17 +1027,184 @@ class EdgeTtsSynthesizer:
         language: str = DEFAULT_SPEECH_LANGUAGE,
     ) -> tuple[bytes, str]:
         _ = language
-        import edge_tts  # type: ignore
 
         self.target = voice
         audio = bytearray()
-        communicator = edge_tts.Communicate(text=text, voice=voice)
+        communicator = self.edge_tts.Communicate(text=text, voice=voice)
 
         async for chunk in communicator.stream():
             if chunk.get('type') == 'audio':
                 audio.extend(chunk.get('data', b''))
 
+        if not audio:
+            raise RuntimeError('No audio was received from edge-tts.')
+
         return bytes(audio), 'audio/mpeg'
+
+
+class SystemTtsSynthesizer:
+    available = True
+    reason = ''
+
+    def __init__(self, alias: str = 'system-tts') -> None:
+        if os.name != 'nt':
+            raise RuntimeError('system-tts is only available on Windows.')
+
+        self.name = alias
+        self.target = 'windows-system-speech'
+        self.metadata = {
+            'engine': 'System.Speech.Synthesis',
+            'mode': 'offline',
+            'format': 'wav',
+        }
+        if alias == 'piper':
+            self.metadata['compatibilityMode'] = 'piper-fallback'
+
+    async def synthesize(
+        self,
+        text: str,
+        voice: str = DEFAULT_TTS_VOICE,
+        language: str = DEFAULT_SPEECH_LANGUAGE,
+    ) -> tuple[bytes, str]:
+        return await asyncio.to_thread(
+            self._synthesize_sync,
+            text,
+            voice,
+            language,
+        )
+
+    def _synthesize_sync(
+        self,
+        text: str,
+        voice: str,
+        language: str,
+    ) -> tuple[bytes, str]:
+        normalized_text = str(text or '').strip()
+        if not normalized_text:
+            return b'', 'audio/wav'
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_audio:
+            output_path = temp_audio.name
+
+        try:
+            text_base64 = base64.b64encode(normalized_text.encode('utf-8')).decode(
+                'ascii'
+            )
+            output_path_base64 = base64.b64encode(
+                output_path.encode('utf-8')
+            ).decode('ascii')
+            voice_base64 = base64.b64encode(str(voice or '').encode('utf-8')).decode(
+                'ascii'
+            )
+            language_base64 = base64.b64encode(
+                str(language or '').encode('utf-8')
+            ).decode('ascii')
+            script = (
+                "$ErrorActionPreference='Stop'; "
+                "Add-Type -AssemblyName System.Speech; "
+                f"$text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{text_base64}')); "
+                f"$path=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{output_path_base64}')); "
+                f"$voiceHint=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{voice_base64}')); "
+                f"$languageHint=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{language_base64}')); "
+                '$synth=New-Object System.Speech.Synthesis.SpeechSynthesizer; '
+                '$installed=@($synth.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo }); '
+                '$selected=$null; '
+                "if ($voiceHint) { "
+                "  $selected=$installed | Where-Object { "
+                "    $_.Name -like ('*' + $voiceHint + '*') -or $_.Id -like ('*' + $voiceHint + '*') "
+                '  } | Select-Object -First 1; '
+                '} '
+                "if (-not $selected -and $languageHint) { "
+                '  $langLower=$languageHint.ToLowerInvariant(); '
+                "  $selected=$installed | Where-Object { "
+                "    $_.Culture.Name.ToLowerInvariant().StartsWith($langLower) -or "
+                "    $_.Culture.TwoLetterISOLanguageName.ToLowerInvariant() -eq $langLower -or "
+                "    $_.Name.ToLowerInvariant().Contains($langLower) "
+                '  } | Select-Object -First 1; '
+                '} '
+                'if ($selected) { $synth.SelectVoice($selected.Name) } '
+                '$synth.SetOutputToWaveFile($path); '
+                '$synth.Speak($text); '
+                '$synth.SetOutputToNull(); '
+                '$synth.Dispose();'
+            )
+            result = subprocess.run(
+                [
+                    'powershell.exe',
+                    '-NoProfile',
+                    '-ExecutionPolicy',
+                    'Bypass',
+                    '-Command',
+                    script,
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=45,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or 'System TTS failed.'
+                )
+
+            with open(output_path, 'rb') as audio_file:
+                audio_bytes = audio_file.read()
+            if not audio_bytes:
+                raise RuntimeError('System TTS returned no audio.')
+            return audio_bytes, 'audio/wav'
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(output_path)
+
+
+class FallbackTtsSynthesizer:
+    available = True
+    reason = ''
+
+    def __init__(
+        self,
+        primary: Any,
+        fallback: Any,
+        *,
+        requested_name: str,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.name = requested_name
+        self.target = str(getattr(primary, 'target', '') or '')
+        self.metadata = {
+            'primaryProvider': getattr(primary, 'name', requested_name),
+            'fallbackProvider': getattr(fallback, 'name', 'system-tts'),
+        }
+
+    async def synthesize(
+        self,
+        text: str,
+        voice: str = DEFAULT_TTS_VOICE,
+        language: str = DEFAULT_SPEECH_LANGUAGE,
+    ) -> tuple[bytes, str]:
+        try:
+            audio_bytes, mime_type = await self.primary.synthesize(
+                text,
+                voice=voice,
+                language=language,
+            )
+            if audio_bytes:
+                self.target = str(getattr(self.primary, 'target', '') or self.target)
+                return audio_bytes, mime_type
+            raise RuntimeError(
+                f"{getattr(self.primary, 'name', self.name)} returned no audio."
+            )
+        except Exception as error:
+            self.metadata['lastFallbackReason'] = str(error)
+            self.target = str(getattr(self.fallback, 'target', '') or self.target)
+            return await self.fallback.synthesize(
+                text,
+                voice=voice,
+                language=language,
+            )
 
 
 class HttpTtsSynthesizer:
@@ -1124,19 +1578,37 @@ def build_transcriber(config: 'VoiceSessionConfig'):
     requested = config.stt_provider
     try:
         if requested == 'faster-whisper':
-            return FasterWhisperTranscriber()
+            return FasterWhisperTranscriber(
+                model_path=config.stt_model_path,
+                model_size=config.stt_model_size,
+            )
         if requested == 'vibevoice-asr':
             return HttpAsrTranscriber(config.vibevoice_asr_url, 'vibevoice-asr')
         return OpenAIWhisperTranscriber()
     except Exception as error:
-        return DummyTranscriber(requested, str(error))
+        return DummyTranscriber(
+            requested,
+            _format_optional_dependency_error(error),
+        )
 
 
 def build_synthesizer(config: 'VoiceSessionConfig'):
     requested = config.tts_provider
     try:
+        if requested == 'system-tts':
+            return SystemTtsSynthesizer()
+        if requested == 'piper':
+            return SystemTtsSynthesizer(alias='piper')
         if requested == 'edge-tts':
-            return EdgeTtsSynthesizer()
+            try:
+                primary = EdgeTtsSynthesizer()
+            except Exception:
+                return SystemTtsSynthesizer()
+            return FallbackTtsSynthesizer(
+                primary,
+                SystemTtsSynthesizer(),
+                requested_name='edge-tts',
+            )
         if requested == 'vibevoice-realtime':
             parsed = urllib.parse.urlsplit(str(config.vibevoice_tts_url or '').strip())
             if parsed.scheme in ('ws', 'wss') or parsed.path in ('', '/', '/stream'):
@@ -1159,7 +1631,10 @@ def build_synthesizer(config: 'VoiceSessionConfig'):
                 },
             )
     except Exception as error:
-        return DummySynthesizer(requested, str(error))
+        return DummySynthesizer(
+            requested,
+            _format_optional_dependency_error(error),
+        )
 
     return DummySynthesizer(requested, f'{requested} is not implemented')
 
@@ -1199,6 +1674,8 @@ class VoiceSessionConfig:
     allow_interrupt: bool = True
     vad_provider: str = 'silero-vad'
     stt_provider: str = 'faster-whisper'
+    stt_model_path: str = ''
+    stt_model_size: str = DEFAULT_FASTER_WHISPER_MODEL_SIZE
     tts_provider: str = 'edge-tts'
     speech_language: str = DEFAULT_SPEECH_LANGUAGE
     tts_voice: str = DEFAULT_TTS_VOICE
@@ -1353,6 +1830,11 @@ class RealtimeVoiceSession:
             allow_interrupt=bool(runtime_config.get('allowInterrupt', True)),
             vad_provider=str(runtime_config.get('vadProvider') or 'silero-vad'),
             stt_provider=str(runtime_config.get('sttProvider') or 'faster-whisper'),
+            stt_model_path=str(runtime_config.get('sttModelPath') or ''),
+            stt_model_size=str(
+                runtime_config.get('sttModelSize')
+                or DEFAULT_FASTER_WHISPER_MODEL_SIZE
+            ),
             tts_provider=str(runtime_config.get('ttsProvider') or 'edge-tts'),
             speech_language=str(
                 runtime_config.get('speechLanguage') or DEFAULT_SPEECH_LANGUAGE

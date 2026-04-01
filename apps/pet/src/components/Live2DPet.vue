@@ -60,13 +60,6 @@
         </button>
       </template>
     </ControlPanel>
-
-    <CameraPreview
-      v-if="shouldShowCameraPreview"
-      :stream="visionStore.previewStream"
-      :position="companionConfigStore.settings.cameraPreviewPosition"
-      :label="cameraPreviewLabel"
-    />
   </div>
 </template>
 
@@ -91,7 +84,6 @@ import { useHitDetection } from '../composables/useHitDetection';
 import { useIdleDetection } from '../composables/useIdleDetection';
 import { useMessageSystem } from '../composables/useMessageSystem';
 import { listenRuntimeEvent } from '../utils/runtimeEvents';
-import CameraPreview from './CameraPreview.vue';
 import ControlPanel from './Live2DPetComponents/ControlPanel.vue';
 import Live2DCanvas from './Live2DPetComponents/Live2DCanvas.vue';
 import Live2DMessage from './Live2DPetComponents/Live2DMessage.vue';
@@ -144,23 +136,6 @@ const currentModel = computed(() => ({
   ...models[0],
   path: live2dStore.activeModelPath || models[0].path,
 }));
-const shouldShowCameraPreview = computed(
-  () =>
-    Boolean(
-      companionConfigStore.settings.cameraEnabled &&
-        companionConfigStore.settings.cameraPreviewEnabled &&
-        visionStore.isActive &&
-        visionStore.previewStream,
-    ),
-);
-const cameraPreviewLabel = computed(() => {
-  const backend = visionStore.backendLabel ? ` (${visionStore.backendLabel})` : '';
-  if (visionStore.lastFaceState?.detected) {
-    return `${rt('petCameraLabel')}${backend}`;
-  }
-
-  return `${rt('petCameraScanningLabel')}${backend}`;
-});
 const gestureSignature = computed(() =>
   (Array.isArray(visionStore.lastGestures) ? visionStore.lastGestures : [])
     .map((gesture) => gesture?.name ?? '')
@@ -420,6 +395,10 @@ const refreshVisionSettings = async (
     await visionStore.stop();
     await visionStore.start();
     return;
+  }
+
+  if (!visionStore.isActive && visionStore.status !== 'connecting') {
+    await visionStore.start();
   }
 };
 
@@ -703,6 +682,18 @@ watch(
     if (nextMessage && nextMessage !== previousMessage) {
       messageState.show(localizeRuntimeText(currentLocale.value, nextMessage));
     }
+  },
+);
+
+watch(
+  () => voiceStore.lastAssistantText,
+  (nextText, previousText) => {
+    const normalized = String(nextText ?? '').trim();
+    if (!normalized || normalized === String(previousText ?? '').trim()) {
+      return;
+    }
+
+    messageState.show(normalized);
   },
 );
 

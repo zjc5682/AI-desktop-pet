@@ -5,6 +5,7 @@ import { ref } from 'vue';
 import { loadCompanionSettings, type CompanionSettings } from '@table-pet/shared';
 import { getDesktopCompanionRuntime } from '../companion/runtime';
 import { localizeRuntimeText, normalizeUiLanguage } from '../i18n/runtimeLocale';
+import { ensureBackendService } from '../utils/desktopCommands';
 
 type VoiceStatus =
   | 'idle'
@@ -214,6 +215,8 @@ const MAX_CAPTURE_SOCKET_BUFFERED_BYTES = 512 * 1024;
 const MAX_CAPTURE_QUEUE_CHUNKS = 48;
 const CAPTURE_QUEUE_DRAIN_INTERVAL_MS = 12;
 const NATIVE_PLAYBACK_BACKEND = 'rust-rodio';
+const VOICE_SOCKET_CONNECT_RETRY_ATTEMPTS = 3;
+const VOICE_SOCKET_CONNECT_RETRY_DELAY_MS = 450;
 
 let commandHandlers: VoiceCommandHandlers = {};
 let socket: WebSocket | null = null;
@@ -246,7 +249,86 @@ function normalizeBackendUrl(url: string): string {
 
 function localizeMessage(message: string) {
   const locale = normalizeUiLanguage(loadCompanionSettings().uiLanguage);
+  if (locale === 'zh-CN') {
+    if (message === 'Unable to start the local backend service.') {
+      return '无法启动本地后端服务。';
+    }
+    if (
+      /^Voice STT is unavailable: No local faster-whisper model was found\..*$/.test(
+        message,
+      )
+    ) {
+      return '语音 STT 当前不可用：没有找到本地 faster-whisper 模型。请在设置页填写本地 CTranslate2 模型目录，或先把模型放到本机 Hugging Face 缓存。';
+    }
+    if (message === 'Voice websocket connection failed.') {
+      return '语音会话连接本地后端失败。';
+    }
+    if (message === 'Voice websocket connection closed before it was ready.') {
+      return '语音会话在初始化完成前就断开了，请检查本地后端日志。';
+    }
+    if (message === 'Voice session timed out before the backend became ready.') {
+      return '语音会话等待后端初始化超时。';
+    }
+    if (
+      /^Voice pipeline failed: STT provider whisper failed: \[WinError 2\]/.test(
+        message,
+      )
+    ) {
+      return 'Whisper 本地转写依赖缺失。当前版本已改为优先走内存 PCM 转写，请重启后端后重试。';
+    }
+  }
   return localizeRuntimeText(locale, message);
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function isRetryableSocketStartupError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return [
+    'Voice websocket connection failed.',
+    'Voice websocket connection closed before it was ready.',
+    'Voice session timed out before the backend became ready.',
+    'Unable to reach the voice websocket backend.',
+    'Voice runtime probe closed before the backend replied.',
+    'TTS preview websocket failed.',
+    'TTS preview websocket closed before audio arrived.',
+  ].includes(message);
+}
+
+async function withVoiceSocketStartupRetries<T>(
+  settings: CompanionSettings,
+  task: () => Promise<T>,
+): Promise<T> {
+  let lastError: unknown = null;
+
+  for (
+    let attemptIndex = 0;
+    attemptIndex < VOICE_SOCKET_CONNECT_RETRY_ATTEMPTS;
+    attemptIndex += 1
+  ) {
+    try {
+      return await task();
+    } catch (error) {
+      lastError = error;
+      const shouldRetry =
+        attemptIndex + 1 < VOICE_SOCKET_CONNECT_RETRY_ATTEMPTS &&
+        isRetryableSocketStartupError(error);
+      if (!shouldRetry) {
+        throw error;
+      }
+
+      await sleep(VOICE_SOCKET_CONNECT_RETRY_DELAY_MS * (attemptIndex + 1));
+      await ensureVoiceBackendReady(settings);
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Voice websocket connection failed.');
 }
 
 function getPreferredCaptureChunkMillis(settings: CompanionSettings) {
@@ -264,6 +346,8 @@ function getVoiceSessionConfig(settings: CompanionSettings) {
     allowInterrupt: settings.allowVoiceInterrupt,
     vadProvider: settings.vadProvider,
     sttProvider: settings.sttProvider,
+    sttModelPath: settings.sttModelPath,
+    sttModelSize: settings.sttModelSize,
     ttsProvider: settings.defaultTtsProvider,
     speechLanguage: settings.speechLanguage,
     ttsVoice: settings.ttsVoice,
@@ -297,6 +381,13 @@ function getVoiceSessionConfig(settings: CompanionSettings) {
   };
 }
 
+async function ensureVoiceBackendReady(settings: CompanionSettings) {
+  await ensureBackendService({
+    backendUrl: settings.chatBackendUrl,
+    timeoutMs: 12000,
+  });
+}
+
 function applySessionReadyPayload(
   payload: Extract<VoiceSocketMessage, { type: 'voice_session_ready' }>,
 ) {
@@ -309,6 +400,22 @@ function applySessionReadyPayload(
   providerIssues.value = Array.isArray(payload.providerIssues)
     ? payload.providerIssues.filter((item): item is string => typeof item === 'string')
     : [];
+}
+
+function getFatalVoiceSessionIssue(
+  payload: Extract<VoiceSocketMessage, { type: 'voice_session_ready' }>,
+) {
+  const diagnostics = payload.providerDiagnostics;
+  const sttDiagnostic = diagnostics?.stt;
+  if (sttDiagnostic && sttDiagnostic.available === false) {
+    const reason = String(sttDiagnostic.reason ?? '').trim();
+    if (reason) {
+      return `Voice STT is unavailable: ${reason}`;
+    }
+    return 'Voice STT is unavailable.';
+  }
+
+  return '';
 }
 
 function stripTranscriptPrefix(text: string, prefix: string) {
@@ -1038,15 +1145,22 @@ async function stopNativePlayback() {
 }
 
 async function destroyNativeAudioPipeline() {
-  const unlisteners = [nativeCaptureChunkUnlisten, nativeCaptureErrorUnlisten];
+  const unlisteners = [
+    nativeCaptureChunkUnlisten,
+    nativeCaptureErrorUnlisten,
+    nativePlaybackFinishedUnlisten,
+    nativePlaybackErrorUnlisten,
+  ];
   nativeCaptureChunkUnlisten = null;
   nativeCaptureErrorUnlisten = null;
+  nativePlaybackFinishedUnlisten = null;
+  nativePlaybackErrorUnlisten = null;
 
   for (const unlisten of unlisteners) {
     try {
       unlisten?.();
     } catch (error) {
-      console.warn('Failed to dispose native voice capture listener.', error);
+      console.warn('Failed to dispose native voice runtime listener.', error);
     }
   }
 
@@ -1062,7 +1176,11 @@ async function teardownVoiceSession(nextStatus: VoiceStatus) {
   clearCaptureSendQueue();
 
   if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: 'voice_session_stop' }));
+    try {
+      socket.send(JSON.stringify({ type: 'voice_session_stop' }));
+    } catch {
+      // ignore socket shutdown races
+    }
   }
 
   socket?.close();
@@ -1374,7 +1492,10 @@ export const useVoiceStore = defineStore('voice', () => {
     lastCaptureOverflowAt.value = 0;
 
     try {
-      socket = await new Promise<WebSocket>((resolve, reject) => {
+      await ensureVoiceBackendReady(settings);
+
+      socket = await withVoiceSocketStartupRetries(settings, async () =>
+        new Promise<WebSocket>((resolve, reject) => {
         const nextSocket = new WebSocket(normalizeBackendUrl(settings.chatBackendUrl));
         let settled = false;
         const readyTimeout = window.setTimeout(() => {
@@ -1406,6 +1527,15 @@ export const useVoiceStore = defineStore('voice', () => {
           try {
             const payload = JSON.parse(raw) as VoiceSocketMessage;
             if (payload.type === 'voice_session_ready') {
+              applySessionReadyPayload(payload);
+              const fatalIssue = getFatalVoiceSessionIssue(payload);
+              if (fatalIssue) {
+                settle(() => {
+                  reject(new Error(fatalIssue));
+                });
+                return;
+              }
+
               settle(() => {
                 isActive.value = true;
                 resolve(nextSocket);
@@ -1455,7 +1585,8 @@ export const useVoiceStore = defineStore('voice', () => {
           }
           isActive.value = false;
         };
-      });
+        }),
+      );
 
       await startCapturePipeline(settings);
     } catch (error) {
@@ -1475,7 +1606,10 @@ export const useVoiceStore = defineStore('voice', () => {
     providerDiagnostics.value = {};
     providerIssues.value = [];
 
-    return await new Promise<VoiceProviderDiagnostics>((resolve, reject) => {
+    await ensureVoiceBackendReady(settings);
+
+    return await withVoiceSocketStartupRetries(settings, async () =>
+      new Promise<VoiceProviderDiagnostics>((resolve, reject) => {
       const probeSocket = new WebSocket(normalizeBackendUrl(settings.chatBackendUrl));
       let settled = false;
 
@@ -1555,7 +1689,8 @@ export const useVoiceStore = defineStore('voice', () => {
         settled = true;
         reject(new Error(probeErrorMessage.value));
       };
-    });
+      }),
+    );
   }
 
   async function stop() {
@@ -1587,7 +1722,10 @@ export const useVoiceStore = defineStore('voice', () => {
     const settings = settingsOverride ?? reloadSettings();
     const backendUrl = normalizeBackendUrl(settings.chatBackendUrl);
 
-    return await new Promise<boolean>((resolve, reject) => {
+    await ensureVoiceBackendReady(settings);
+
+    return await withVoiceSocketStartupRetries(settings, async () =>
+      new Promise<boolean>((resolve, reject) => {
       const previewSocket = new WebSocket(backendUrl);
       let settled = false;
 
@@ -1668,7 +1806,8 @@ export const useVoiceStore = defineStore('voice', () => {
           }),
         );
       };
-    }).catch((error) => {
+      }),
+    ).catch((error) => {
       errorMessage.value = localizeMessage(
         error instanceof Error ? error.message : 'TTS preview failed.',
       );
@@ -1708,3 +1847,86 @@ export const useVoiceStore = defineStore('voice', () => {
     registerCommandHandlers,
   };
 });
+
+function disposeVoiceRuntimeForReload() {
+  clearCaptureSendQueue();
+  isActive.value = false;
+
+  if (socket) {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    try {
+      socket.close();
+    } catch {
+      // ignore close failure during reload
+    }
+    socket = null;
+  }
+
+  const unlisteners = [
+    nativeCaptureChunkUnlisten,
+    nativeCaptureErrorUnlisten,
+    nativePlaybackFinishedUnlisten,
+    nativePlaybackErrorUnlisten,
+  ];
+  nativeCaptureChunkUnlisten = null;
+  nativeCaptureErrorUnlisten = null;
+  nativePlaybackFinishedUnlisten = null;
+  nativePlaybackErrorUnlisten = null;
+
+  for (const unlisten of unlisteners) {
+    try {
+      unlisten?.();
+    } catch {
+      // ignore listener disposal failures during reload
+    }
+  }
+
+  playbackGeneration += 1;
+  playbackQueue = [];
+  playbackDrainPromise = null;
+  playbackStreamEnded = false;
+  playbackScheduledUntil = 0;
+  for (const sourceNode of playbackSourceNodes) {
+    try {
+      sourceNode.onended = null;
+      sourceNode.stop();
+      sourceNode.disconnect();
+    } catch {
+      // ignore node disposal failures during reload
+    }
+  }
+  playbackSourceNodes.clear();
+  playbackMode = 'none';
+  resetNativePlaybackState();
+
+  if (playbackContext) {
+    const context = playbackContext;
+    playbackContext = null;
+    void context.close().catch(() => undefined);
+  }
+
+  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
+    void invoke('stop_voice_capture').catch(() => undefined);
+    void invoke('stop_voice_playback').catch(() => undefined);
+  }
+}
+
+function handleVoiceRuntimeBeforeUnload() {
+  disposeVoiceRuntimeForReload();
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', handleVoiceRuntimeBeforeUnload);
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', handleVoiceRuntimeBeforeUnload);
+    }
+    disposeVoiceRuntimeForReload();
+  });
+}

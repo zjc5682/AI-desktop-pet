@@ -47,6 +47,8 @@ export interface CompanionSettings {
   autoStartMicrophone: boolean;
   vadProvider: string;
   sttProvider: string;
+  sttModelPath: string;
+  sttModelSize: string;
   speechLanguage: string;
   ttsVoice: string;
   audioCaptureBackend: string;
@@ -218,6 +220,8 @@ export const DEFAULT_COMPANION_SETTINGS: CompanionSettings = {
   autoStartMicrophone: false,
   vadProvider: 'silero-vad',
   sttProvider: 'faster-whisper',
+  sttModelPath: '',
+  sttModelSize: 'small',
   speechLanguage: 'zh',
   ttsVoice: 'zh-CN-XiaoxiaoNeural',
   audioCaptureBackend: 'rust',
@@ -237,7 +241,7 @@ export const DEFAULT_COMPANION_SETTINGS: CompanionSettings = {
   expressionModelPath: 'models/vision/emotion-ferplus/model.onnx',
   gazeTrackingEnabled: true,
   gestureRecognitionEnabled: false,
-  cameraPreviewEnabled: true,
+  cameraPreviewEnabled: false,
   cameraPreviewPosition: 'bottom-left',
   videoCallEnabled: true,
   empathySyncEnabled: true,
@@ -288,7 +292,7 @@ export const DEFAULT_PERMISSION_STATE: PermissionState = {
 };
 
 export const DEFAULT_DESKTOP_PET_SETTINGS: DesktopPetSettings = {
-  enableChat: false,
+  enableChat: true,
   showMessages: true,
   alwaysOnTop: true,
   idleDetection: true,
@@ -332,6 +336,11 @@ function normalizeAudioCaptureBackend(value: string | null | undefined): string 
   return value === 'rust' ? 'rust' : 'rust';
 }
 
+function normalizeSttModelSize(value: string | null | undefined): string {
+  const normalized = String(value ?? '').trim();
+  return normalized || 'small';
+}
+
 function normalizeCompanionSettings(
   settings: CompanionSettings,
 ): CompanionSettings {
@@ -340,6 +349,8 @@ function normalizeCompanionSettings(
     uiLanguage: normalizeUiLanguage(settings.uiLanguage),
     wakeWord: normalizeWakeWord(settings.wakeWord),
     audioCaptureBackend: normalizeAudioCaptureBackend(settings.audioCaptureBackend),
+    sttModelPath: String(settings.sttModelPath ?? '').trim(),
+    sttModelSize: normalizeSttModelSize(settings.sttModelSize),
   };
 }
 

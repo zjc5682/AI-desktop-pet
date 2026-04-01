@@ -49,6 +49,16 @@ let lastRelationshipSyncAt = 0;
 let lastAutoOrganizeAt = 0;
 const warningCooldowns = new Map<string, number>();
 
+function disposeDesktopServicesRuntimeForReload() {
+  isRunning.value = false;
+  desktopHandlers = {};
+
+  if (intervalId !== null) {
+    window.clearInterval(intervalId);
+    intervalId = null;
+  }
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -591,3 +601,21 @@ export const useDesktopServicesStore = defineStore('desktopServices', () => {
     syncRelationshipState,
   };
 });
+
+function handleDesktopServicesBeforeUnload() {
+  disposeDesktopServicesRuntimeForReload();
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', handleDesktopServicesBeforeUnload);
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', handleDesktopServicesBeforeUnload);
+    }
+
+    disposeDesktopServicesRuntimeForReload();
+  });
+}

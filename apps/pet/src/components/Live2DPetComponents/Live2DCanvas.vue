@@ -26,8 +26,10 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 let app: PIXI.Application | null = null;
 let model: any = null;
 let Live2DModelCtor: {
-  from(source: string): Promise<any>;
+  from(source: string, options?: Record<string, unknown>): Promise<any>;
 } | null = null;
+const MODEL_TICK_PRIORITY =
+  typeof PIXI.UPDATE_PRIORITY?.HIGH === 'number' ? PIXI.UPDATE_PRIORITY.HIGH : 50;
 
 const loadScript = async (src: string, ready: () => boolean) => {
   if (ready()) {
@@ -112,11 +114,39 @@ const cleanupModel = () => {
     return;
   }
 
+  if ('autoUpdate' in model) {
+    model.autoUpdate = false;
+  }
   app.stage.removeChild(model);
   if (typeof model.destroy === 'function') {
     model.destroy();
   }
   model = null;
+};
+
+const tickModelFrame = (deltaMs = 16.67) => {
+  if (!model || typeof model.update !== 'function') {
+    return;
+  }
+
+  model.update(Math.max(1, deltaMs));
+};
+
+const handleModelTicker = () => {
+  tickModelFrame(app?.ticker.deltaMS ?? 16.67);
+};
+
+const registerModelTicker = () => {
+  if (!app) {
+    return;
+  }
+
+  app.ticker.remove(handleModelTicker);
+  app.ticker.add(handleModelTicker, undefined, MODEL_TICK_PRIORITY);
+};
+
+const unregisterModelTicker = () => {
+  app?.ticker.remove(handleModelTicker);
 };
 
 const playInitialMotion = () => {
@@ -156,12 +186,17 @@ const loadModel = async (modelPath: string) => {
   cleanupModel();
 
   try {
-    model = await Live2DModelCtor.from(modelPath);
+    model = await Live2DModelCtor.from(modelPath, {
+      autoUpdate: false,
+      autoInteract: false,
+    });
     model.modelJsonUrl = modelPath;
-    model.autoUpdate = true;
+    model.autoUpdate = false;
+    tickModelFrame();
     app.stage.addChild(model);
     resizeModel();
     playInitialMotion();
+    app.render();
     emit('model-loaded', model);
   } catch (error) {
     console.error('Failed to load Live2D model:', error);
@@ -307,8 +342,12 @@ onMounted(() => {
         height: props.height,
         autoDensity: true,
         resolution: window.devicePixelRatio || 1,
+        autoStart: false,
+        sharedTicker: false,
       });
 
+      app.ticker.stop();
+      registerModelTicker();
       app.ticker.start();
       await loadModel(props.modelPath);
     } catch (error) {
@@ -318,6 +357,8 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  app?.ticker.stop();
+  unregisterModelTicker();
   cleanupModel();
   app?.destroy(true);
   app = null;

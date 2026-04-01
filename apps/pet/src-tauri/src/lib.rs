@@ -16,6 +16,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(audio_capture::VoiceCaptureState::default())
         .manage(audio_playback::VoicePlaybackState::default())
+        .manage(desktop_services::BackendServiceState::default())
         .manage(shortcut_manager::ShortcutRegistry::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -38,6 +39,7 @@ pub fn run() {
             desktop_services::organize_directory,
             desktop_services::batch_rename_files,
             desktop_services::toggle_main_window_visibility,
+            desktop_services::ensure_backend_service,
             desktop_services::capture_primary_screen,
             desktop_services::fetch_webpage_preview,
             shortcut_manager::update_global_shortcuts

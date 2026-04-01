@@ -1,9 +1,13 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Cursor;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -15,6 +19,23 @@ use screenshots::Screen;
 use serde::{Deserialize, Serialize};
 use sysinfo::{Components, System};
 use tauri::Manager;
+
+const DEFAULT_BACKEND_HOST: &str = "127.0.0.1";
+const DEFAULT_BACKEND_PORT: u16 = 8766;
+const DEFAULT_BACKEND_START_TIMEOUT_MS: u64 = 12_000;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Default)]
+pub struct BackendServiceState {
+    process: Mutex<BackendServiceProcess>,
+}
+
+#[derive(Default)]
+struct BackendServiceProcess {
+    child: Option<Child>,
+    log_path: Option<PathBuf>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,6 +114,28 @@ pub struct ScreenshotCaptureResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EnsureBackendServiceRequest {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendServiceStatus {
+    pub running: bool,
+    pub started: bool,
+    pub host: String,
+    pub port: u16,
+    pub url: String,
+    pub pid: Option<u32>,
+    pub backend_dir: String,
+    pub log_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScreenshotRegion {
     pub x: i32,
     pub y: i32,
@@ -124,6 +167,160 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, String> {
     }
 
     fs::canonicalize(path).map_err(|error| error.to_string())
+}
+
+fn normalize_backend_host(host: Option<String>) -> Result<String, String> {
+    let normalized = host
+        .unwrap_or_else(|| DEFAULT_BACKEND_HOST.to_string())
+        .trim()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(DEFAULT_BACKEND_HOST.to_string());
+    }
+
+    if normalized == "localhost" {
+        return Ok(DEFAULT_BACKEND_HOST.to_string());
+    }
+
+    if normalized == DEFAULT_BACKEND_HOST {
+        return Ok(normalized);
+    }
+
+    Err("Local backend autostart is only supported for loopback websocket URLs.".to_string())
+}
+
+fn backend_url(host: &str, port: u16) -> String {
+    format!("ws://{}:{}/", host, port)
+}
+
+fn resolve_backend_root() -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("backend-python");
+    canonical_dir(&candidate)
+}
+
+fn resolve_backend_log_path(
+    app: &tauri::AppHandle,
+    backend_dir: &Path,
+) -> Result<PathBuf, String> {
+    let log_root = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| backend_dir.to_path_buf())
+        .join("logs");
+    fs::create_dir_all(&log_root).map_err(|error| error.to_string())?;
+    Ok(log_root.join("backend-websocket.log"))
+}
+
+fn open_backend_log_file(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())
+}
+
+fn configure_backend_command(
+    command: &mut Command,
+    backend_dir: &Path,
+    log_path: &Path,
+) -> Result<(), String> {
+    let stdout_file = open_backend_log_file(log_path)?;
+    let stderr_file = stdout_file.try_clone().map_err(|error| error.to_string())?;
+
+    command
+        .current_dir(backend_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("HF_HUB_DISABLE_PROGRESS_BARS", "1");
+
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    Ok(())
+}
+
+fn spawn_backend_process(backend_dir: &Path, log_path: &Path) -> Result<Child, String> {
+    let mut launch_errors = Vec::new();
+
+    let attempts: [(&str, &[&str]); 2] = [
+        ("py", &["-3.11", "manage_backend_env.py", "run", "websocket_server.py"]),
+        ("python", &["manage_backend_env.py", "run", "websocket_server.py"]),
+    ];
+
+    for (program, args) in attempts {
+        let mut command = Command::new(program);
+        command.args(args);
+        configure_backend_command(&mut command, backend_dir, log_path)?;
+
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) => launch_errors.push(format!("{}: {}", program, error)),
+        }
+    }
+
+    Err(format!(
+        "Unable to start the local backend service. {}",
+        launch_errors.join(" | ")
+    ))
+}
+
+fn is_backend_port_open(host: &str, port: u16) -> bool {
+    let address = format!("{}:{}", host, port);
+    let Some(socket_addr) = address.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) else {
+        return false;
+    };
+
+    TcpStream::connect_timeout(&socket_addr, Duration::from_millis(250)).is_ok()
+}
+
+fn cleanup_finished_backend_process(process: &mut BackendServiceProcess) {
+    let Some(child) = process.child.as_mut() else {
+        return;
+    };
+
+    match child.try_wait() {
+        Ok(Some(_status)) => {
+            process.child = None;
+        }
+        Ok(None) => {}
+        Err(_error) => {}
+    }
+}
+
+fn build_backend_status(
+    host: &str,
+    port: u16,
+    started: bool,
+    pid: Option<u32>,
+    backend_dir: &Path,
+    log_path: &Path,
+    message: &str,
+) -> BackendServiceStatus {
+    BackendServiceStatus {
+        running: true,
+        started,
+        host: host.to_string(),
+        port,
+        url: backend_url(host, port),
+        pid,
+        backend_dir: backend_dir.display().to_string(),
+        log_path: log_path.display().to_string(),
+        message: message.to_string(),
+    }
 }
 
 fn normalize_text(text: &str) -> String {
@@ -501,6 +698,113 @@ pub fn batch_rename_files(request: BatchRenameRequest) -> Result<BatchRenameResp
 #[tauri::command]
 pub fn toggle_main_window_visibility(app: tauri::AppHandle) -> Result<bool, String> {
     toggle_main_window_visibility_impl(&app)
+}
+
+#[tauri::command]
+pub fn ensure_backend_service(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, BackendServiceState>,
+    request: EnsureBackendServiceRequest,
+) -> Result<BackendServiceStatus, String> {
+    let host = normalize_backend_host(request.host)?;
+    let port = request.port.unwrap_or(DEFAULT_BACKEND_PORT);
+    let timeout_ms = request
+        .timeout_ms
+        .unwrap_or(DEFAULT_BACKEND_START_TIMEOUT_MS)
+        .clamp(1_500, 30_000);
+    let backend_dir = resolve_backend_root()?;
+    let log_path = resolve_backend_log_path(&app, &backend_dir)?;
+
+    let mut guard = state
+        .inner()
+        .process
+        .lock()
+        .map_err(|_| "Backend service state is unavailable.".to_string())?;
+    cleanup_finished_backend_process(&mut guard);
+
+    if is_backend_port_open(&host, port) {
+        guard.log_path = Some(log_path.clone());
+        let pid = guard.child.as_ref().map(|child| child.id());
+        return Ok(build_backend_status(
+            &host,
+            port,
+            false,
+            pid,
+            &backend_dir,
+            &log_path,
+            "Backend service is already running.",
+        ));
+    }
+
+    let started_now = if guard.child.is_none() {
+        let child = spawn_backend_process(&backend_dir, &log_path)?;
+        guard.log_path = Some(log_path.clone());
+        guard.child = Some(child);
+        true
+    } else {
+        false
+    };
+    drop(guard);
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if is_backend_port_open(&host, port) {
+            let guard = state
+                .inner()
+                .process
+                .lock()
+                .map_err(|_| "Backend service state is unavailable.".to_string())?;
+            let pid = guard.child.as_ref().map(|child| child.id());
+            return Ok(build_backend_status(
+                &host,
+                port,
+                started_now,
+                pid,
+                &backend_dir,
+                &log_path,
+                if started_now {
+                    "Backend service started."
+                } else {
+                    "Backend service is already running."
+                },
+            ));
+        }
+
+        let mut guard = state
+            .inner()
+            .process
+            .lock()
+            .map_err(|_| "Backend service state is unavailable.".to_string())?;
+        if let Some(child) = guard.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    guard.child = None;
+                    return Err(format!(
+                        "Unable to start the local backend service. Exit status: {}. Check {}.",
+                        status,
+                        log_path.display()
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Unable to inspect the local backend service. {}",
+                        error
+                    ));
+                }
+            }
+        }
+        drop(guard);
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Unable to start the local backend service. Check {}.",
+                log_path.display()
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(160));
+    }
 }
 
 #[tauri::command]

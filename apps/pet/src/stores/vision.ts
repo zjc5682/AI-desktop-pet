@@ -3,6 +3,7 @@ import { ref, shallowRef } from 'vue';
 import { loadCompanionSettings, type CompanionSettings } from '@table-pet/shared';
 import type { FaceState, GestureState } from '@table-pet/perception';
 import { localizeRuntimeText, normalizeUiLanguage } from '../i18n/runtimeLocale';
+import { ensureBackendService } from '../utils/desktopCommands';
 
 type VisionStatus = 'idle' | 'connecting' | 'watching' | 'error';
 
@@ -73,6 +74,12 @@ function normalizeBackendUrl(url: string): string {
 
 function localizeMessage(message: string) {
   const locale = normalizeUiLanguage(loadCompanionSettings().uiLanguage);
+  if (locale === 'zh-CN' && message === 'Unable to start the local backend service.') {
+    return '无法启动本地后端服务。';
+  }
+  if (locale === 'zh-CN' && message === 'Unable to start the local backend service.') {
+    return '无法启动本地后端服务。';
+  }
   return localizeRuntimeText(locale, message);
 }
 
@@ -124,6 +131,48 @@ function cleanupCamera() {
   }
 
   previewStream.value = null;
+}
+
+function resetVisionRuntimeState() {
+  isActive.value = false;
+  setStatus('idle');
+  errorMessage.value = '';
+  lastFaceState.value = null;
+  lastGestures.value = [];
+  backendLabel.value = '';
+  lastFrameAt.value = 0;
+  lastFaceDetectedAt.value = 0;
+  persistLastFaceDetectedAt(0);
+}
+
+function disposeVisionRuntimeForReload() {
+  stopCaptureLoop();
+
+  if (socket) {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+
+    try {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'vision_session_stop' }));
+      }
+    } catch {
+      // Ignore websocket shutdown races during HMR disposal.
+    }
+
+    try {
+      socket.close();
+    } catch {
+      // Ignore close failures during HMR disposal.
+    }
+
+    socket = null;
+  }
+
+  cleanupCamera();
+  resetVisionRuntimeState();
 }
 
 async function createCameraFeed() {
@@ -336,6 +385,10 @@ export const useVisionStore = defineStore('vision', () => {
     persistLastFaceDetectedAt(0);
 
     try {
+      await ensureBackendService({
+        backendUrl: settings.chatBackendUrl,
+        timeoutMs: 12000,
+      });
       await createCameraFeed();
 
       socket = await new Promise<WebSocket>((resolve, reject) => {
@@ -441,3 +494,21 @@ export const useVisionStore = defineStore('vision', () => {
     reloadSettings,
   };
 });
+
+function handleVisionRuntimeBeforeUnload() {
+  disposeVisionRuntimeForReload();
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', handleVisionRuntimeBeforeUnload);
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', handleVisionRuntimeBeforeUnload);
+    }
+
+    disposeVisionRuntimeForReload();
+  });
+}

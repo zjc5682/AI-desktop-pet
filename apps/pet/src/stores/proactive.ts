@@ -24,6 +24,16 @@ const remindedMemoryKeys = ref<string[]>([]);
 let proactiveHandlers: ProactiveHandlers = {};
 let intervalId: number | null = null;
 
+function disposeProactiveRuntimeForReload() {
+  isRunning.value = false;
+  proactiveHandlers = {};
+
+  if (intervalId !== null) {
+    window.clearInterval(intervalId);
+    intervalId = null;
+  }
+}
+
 function extractReminderDate(key: string): string | null {
   const parts = key.split(':');
   if (parts.length < 3 || parts[0] !== 'reminder') {
@@ -235,3 +245,21 @@ export const useProactiveStore = defineStore('proactive', () => {
     registerHandlers,
   };
 });
+
+function handleProactiveRuntimeBeforeUnload() {
+  disposeProactiveRuntimeForReload();
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', handleProactiveRuntimeBeforeUnload);
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', handleProactiveRuntimeBeforeUnload);
+    }
+
+    disposeProactiveRuntimeForReload();
+  });
+}

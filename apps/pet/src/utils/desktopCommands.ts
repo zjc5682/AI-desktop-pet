@@ -59,9 +59,44 @@ export interface ScreenshotCaptureRegion {
   height: number;
 }
 
+export interface BackendServiceStatus {
+  running: boolean;
+  started: boolean;
+  host: string;
+  port: number;
+  url: string;
+  pid?: number | null;
+  backendDir: string;
+  logPath: string;
+  message: string;
+}
+
 function ensureDesktopRuntime() {
   if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
     throw new Error('Desktop commands require the Tauri runtime.');
+  }
+}
+
+function parseLocalBackendUrl(backendUrl?: string) {
+  const raw = backendUrl?.trim() || 'ws://127.0.0.1:8766';
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.trim().toLowerCase();
+    if (host !== '127.0.0.1' && host !== 'localhost') {
+      return null;
+    }
+
+    const port = Number(parsed.port || '8766');
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      return null;
+    }
+
+    return {
+      host: '127.0.0.1',
+      port,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -99,6 +134,37 @@ export async function batchRenameFiles(request: {
 export async function toggleMainWindowVisibility(): Promise<boolean> {
   ensureDesktopRuntime();
   return invoke<boolean>('toggle_main_window_visibility');
+}
+
+export async function ensureBackendService(options?: {
+  backendUrl?: string;
+  timeoutMs?: number;
+}): Promise<BackendServiceStatus | null> {
+  ensureDesktopRuntime();
+
+  const parsed = parseLocalBackendUrl(options?.backendUrl);
+  if (!parsed) {
+    return null;
+  }
+
+  try {
+    return await invoke<BackendServiceStatus>('ensure_backend_service', {
+      request: {
+        host: parsed.host,
+        port: parsed.port,
+        timeoutMs: options?.timeoutMs ?? 12000,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to ensure the local backend service.', error);
+    const detail =
+      error instanceof Error ? error.message : String(error ?? '').trim();
+    throw new Error(
+      detail
+        ? `Unable to start the local backend service. ${detail}`
+        : 'Unable to start the local backend service.',
+    );
+  }
 }
 
 export async function capturePrimaryScreen(options?: {

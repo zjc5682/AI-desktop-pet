@@ -678,6 +678,44 @@
             </select>
           </div>
 
+          <div
+            v-if="companionSettings.sttProvider === 'faster-whisper'"
+            class="setting-field wide-field"
+          >
+            <label class="field-label" for="stt-model-path">{{ t('sttModelPath') }}</label>
+            <input
+              id="stt-model-path"
+              v-model.trim="companionSettings.sttModelPath"
+              class="setting-text-input"
+              :placeholder="t('localModelPathPlaceholder')"
+              type="text"
+            >
+            <p class="setting-help">
+              {{ t('sttModelPathHelp') }}
+            </p>
+          </div>
+
+          <div
+            v-if="companionSettings.sttProvider === 'faster-whisper'"
+            class="setting-field"
+          >
+            <label class="field-label" for="stt-model-size">{{ t('sttModelSize') }}</label>
+            <select
+              id="stt-model-size"
+              v-model="companionSettings.sttModelSize"
+              class="setting-select"
+            >
+              <option value="tiny">tiny</option>
+              <option value="base">base</option>
+              <option value="small">small</option>
+              <option value="medium">medium</option>
+              <option value="large-v3">large-v3</option>
+            </select>
+            <p class="setting-help">
+              {{ t('sttModelSizeHelp') }}
+            </p>
+          </div>
+
           <div class="setting-field">
             <label class="field-label" for="tts-provider">{{ t('tts') }}</label>
             <select
@@ -686,6 +724,7 @@
               class="setting-select"
             >
               <option value="edge-tts">Edge-TTS</option>
+              <option value="system-tts">System TTS</option>
               <option value="piper">Piper</option>
               <option value="vibevoice-realtime">VibeVoice-Realtime</option>
               <option value="gpt-sovits">GPT-SoVITS</option>
@@ -716,6 +755,12 @@
                 class="setting-help"
               >
                 {{ t('vibeVoiceVoiceHelp') }}
+              </p>
+              <p
+                v-if="['edge-tts', 'system-tts', 'piper'].includes(companionSettings.defaultTtsProvider)"
+                class="setting-help"
+              >
+                {{ t('offlineTtsFallbackHelp') }}
               </p>
             </div>
           </div>
@@ -979,28 +1024,6 @@
               <h3>{{ t('previewEmpathyTitle') }}</h3>
               <p>{{ t('previewEmpathyCopy') }}</p>
             </div>
-          </div>
-
-          <div class="setting-row">
-            <span>{{ t('cameraPreviewOverlay') }}</span>
-            <label class="switch">
-              <input v-model="companionSettings.cameraPreviewEnabled" type="checkbox">
-              <span class="slider"></span>
-            </label>
-          </div>
-
-          <div class="setting-field">
-            <label class="field-label" for="camera-preview-position">{{ t('previewPosition') }}</label>
-            <select
-              id="camera-preview-position"
-              v-model="companionSettings.cameraPreviewPosition"
-              class="setting-select"
-            >
-              <option value="bottom-left">{{ t('bottomLeft') }}</option>
-              <option value="bottom-right">{{ t('bottomRight') }}</option>
-              <option value="top-left">{{ t('topLeft') }}</option>
-              <option value="top-right">{{ t('topRight') }}</option>
-            </select>
           </div>
 
           <div class="setting-row">
@@ -1788,6 +1811,8 @@ function formatChatProviderLabel(provider: string): string {
 
 function formatTtsProviderLabel(provider: string): string {
   switch (provider) {
+    case 'system-tts':
+      return 'System TTS';
     case 'piper':
       return 'Piper';
     case 'vibevoice-realtime':

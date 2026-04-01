@@ -6,6 +6,7 @@ import {
   type ScreenshotCaptureRegion,
   type ScreenshotCaptureResult,
 } from '../utils/desktopCommands';
+import { ensureDesktopRuntimeBackendReady } from '../companion/runtime';
 import {
   emitRuntimeEvent,
   isTauriRuntime,
@@ -301,6 +302,7 @@ export const useScreenshotTranslationStore = defineStore('screenshotTranslation'
         region,
       });
       status.value = 'processing';
+      await ensureDesktopRuntimeBackendReady();
       const result = await requestScreenshotTranslation(
         normalizeBackendUrl(settings),
         screenshot,

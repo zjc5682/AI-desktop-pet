@@ -7,6 +7,7 @@ import {
 } from '@table-pet/shared';
 import { getDesktopCompanionRuntime } from '../companion/runtime';
 import { localizeRuntimeText, normalizeUiLanguage } from '../i18n/runtimeLocale';
+import { ensureBackendService } from '../utils/desktopCommands';
 
 export interface ChatMessage {
   id: string;
@@ -36,6 +37,9 @@ function normalizeBackendUrl(url: string): string {
 
 function localizeMessage(message: string) {
   const locale = normalizeUiLanguage(loadCompanionSettings().uiLanguage);
+  if (locale === 'zh-CN' && message === 'Unable to start the local backend service.') {
+    return '无法启动本地后端服务。';
+  }
   return localizeRuntimeText(locale, message);
 }
 
@@ -109,6 +113,10 @@ export const useWebSocketStore = defineStore('websocket', () => {
 
   async function connect() {
     const companionSettings = loadCompanionSettings();
+    await ensureBackendService({
+      backendUrl: companionSettings.chatBackendUrl,
+      timeoutMs: 12000,
+    });
     runtime.chatClient.setUrl(normalizeBackendUrl(companionSettings.chatBackendUrl));
     await runtime.chatClient.connect();
   }
